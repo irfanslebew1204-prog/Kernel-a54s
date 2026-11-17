@@ -1,0 +1,159 @@
+name: Build kernel OPPO A54s (CPH2273)
+
+# Cara pakai: tab Actions -> "Build kernel OPPO A54s" -> Run workflow.
+# Hasil: file zip AnyKernel3 di tab Releases (flash lewat aplikasi Kernel Flasher).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Siapkan toolchain (clang 11, versi sama dengan kernel bawaan)
+        run: |
+          set -e
+          echo "deb [trusted=yes] http://archive.ubuntu.com/ubuntu jammy main universe" | sudo tee /etc/apt/sources.list.d/jammy-tmp.list
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clang-11 lld-11 llvm-11 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi flex bison bc libssl-dev libelf-dev cpio xz-utils lz4 zip
+          mkdir -p "$HOME/llvm-bin"
+          for t in ld.lld llvm-nm llvm-ar llvm-objcopy llvm-objdump llvm-strip llvm-readelf; do
+            ln -sf "/usr/bin/$t-11" "$HOME/llvm-bin/$t"
+          done
+          # pembungkus clang: buang "-Werror" polos (kode OPPO/MTK penuh warning yang di clang 11.1 jadi error)
+          cat > "$HOME/llvm-bin/clang" <<'EOF'
+          #!/bin/bash
+          args=()
+          for a in "$@"; do [ "$a" = "-Werror" ] || args+=("$a"); done
+          exec /usr/bin/clang-11 "${args[@]}"
+          EOF
+          chmod +x "$HOME/llvm-bin/clang"
+          echo "$HOME/llvm-bin" >> "$GITHUB_PATH"
+
+      - name: Ambil source (dikunci ke commit tertentu)
+        run: |
+          set -e
+          fetch() {
+            git init -q "$1"
+            git -C "$1" remote add origin "$2"
+            git -C "$1" fetch -q --depth=1 origin "$3"
+            git -C "$1" checkout -q FETCH_HEAD
+          }
+          mkdir -p "$HOME/w" && cd "$HOME/w"
+          # source kernel OPPO A16/A54 (MT6765, Android 11, kernel 4.19.127)
+          fetch kernel-4.19 https://github.com/oppo-source/android_kernel_oppo_mt6765.git 220d8e1a728dd8a4d2f25e8aadb66be6f92b440a
+          # driver tambahan OPPO (touchscreen, charger, audio, dll) - wajib ada di folder "vendor" sejajar kernel-4.19
+          fetch modules https://github.com/oppo-source/android_kernel_modules_oppo_mt6765.git 6373cd3367f5b404839a2689c6e88f008469e604
+          cp -a modules/source/vendor vendor
+          # driver exFAT publik (pengganti file OPPO yang tidak dirilis)
+          fetch exfat https://github.com/arter97/exfat-linux.git 034f47d607c441e7fb5be3eb71d7a289ef76bc0c
+          # pembungkus flash tanpa recovery
+          fetch ak3 https://github.com/osm0sis/AnyKernel3.git 41f04bdb4ee30a44e429c2c1131d5e8bb32b15f1
+
+      - name: Tambal bagian source OPPO yang tidak dirilis
+        run: |
+          set -e
+          cd "$HOME/w/kernel-4.19"
+          # exfat: symlink OPPO rusak -> ganti driver publik
+          rm -f fs/exfat
+          mkdir fs/exfat
+          cp ../exfat/*.c ../exfat/*.h ../exfat/Kconfig ../exfat/Makefile fs/exfat/
+          # osdcardfs (fork OPPO) tidak dirilis -> pakai sdcardfs bawaan source
+          sed -i 's/^ifneq (\$(TARGET_PRODUCT),qssi)/ifeq (1,0)/' fs/Makefile
+          grep -n "ifeq (1,0)" fs/Makefile
+
+      - name: Kompilasi kernel
+        run: |
+          set -eo pipefail
+          cd "$HOME/w/kernel-4.19"
+          export KBUILD_BUILD_USER=builder KBUILD_BUILD_HOST=github
+          # variabel bawaan sistem build Android OPPO yang dibaca Makefile driver
+          export TARGET_PRODUCT=full_oppo6765 TARGET_BUILD_VARIANT=user
+          # meniru oplus_native_features.sh dari sistem build Android OPPO (fitur OPLUS_* dibaca Makefile)
+          while IFS='=' read -r k v; do
+            case "$k" in ''|*[!A-Z0-9_]*) continue;; esac
+            export "$k=$v"
+          done < oplus_native_features.mk
+          M="make -j$(nproc) O=out ARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip READELF=llvm-readelf CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi-"
+          # clang 11.1 lebih ketat dari clang bawaan OPPO: turunkan beberapa error jadi peringatan
+          KC="-Wno-error=strict-prototypes -Wno-error=implicit-int -Wno-error=incompatible-pointer-types -Wno-error=date-time"
+
+          $M oppo6765_20375_defconfig
+
+          S=scripts/config
+          C=out/.config
+          # 1) samakan dengan config bawaan HP (build rilis)
+          $S --file $C -d SECURITY_SELINUX_DEVELOP -d KMALLOC_DEBUG -d VMALLOC_DEBUG -d DUMP_TASKS_MEM \
+             -d OPLUS_CTP -d HSKEY_BLOCK -d EROFS_FS -d OPLUS_FEATURE_AUDIO_OPT
+          $S --file $C --set-str CUSTOM_KERNEL_IMGSENSOR "yogurt_truly_main_s5k3l6 yogurt_qtech_main_ov13b10 yogurt_qtech_front_s5k4h7 yogurt_cxt_depth_gc02m1b yogurt_lhyx_micro_gc02k0 yogurt_shengtai_front_gc5035 yogurt_lce_front_hi556 yogurt_shengtai_front_ov8856 yogurt_lhyx_depth_gc02m1b yogurt_hlt_depth_gc02m1b yogurt_shengtai_micro_gc02k0 yogurt_cxt_micro_gc02k0 yogurt_cxt_micro_gc02m1  yogurt_sunny_front_s5k3p9sp yogurt_shengtai_mono_ov02b1b yogurt_hlt_micro_gc02m1 yogurt_hlt_micro_ov02b10 parkera_qtech_main_ov13b10 parkera_shinetech_mono_gc02m1b parkera_shinetech_mono_ov02b1b parkera_holitech_macro_gc02m1 parkera_shinetech_macro_ov02b10 parkera_holitech_front_s5k4h7 parkera_shinetech_front_ov08d10 parkera_shinetech_main_s5kjn103 parkera_qtech_main_ov13b2a parkera_shinetech_mono_gc02m1b_50m parkera_shinetech_mono_ov02b1b_50m parkerb_shinetech_main_s5kjn103 parkerb_sunny_front_s5k3p9sp parkerb_shinetech_mono_gc02m1b parkerb_hlt_micro_gc02m1 parkerb_shinetech_macro_ov02b10"
+          # 2) modul .ko bawaan OPPO (baterai, SD card, headset) ditandatangani kunci OPPO -> jangan ditolak
+          $S --file $C -d MODULE_SIG_FORCE
+          # 3) tweak performa: kompilasi -O2 (bawaan -Os), TCP default cubic (bawaan bic)
+          $S --file $C -d CC_OPTIMIZE_FOR_SIZE -e CC_OPTIMIZE_FOR_PERFORMANCE
+          $S --file $C --set-str DEFAULT_TCP_CONG cubic
+
+          $M olddefconfig
+          make O=out ARCH=arm64 CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- kernelrelease | tail -1
+          $M KCFLAGS="$KC" Image.gz 2>&1 | tee "$HOME/w/build.log" | tail -n 400
+          test -s out/arch/arm64/boot/Image.gz
+
+      - name: Bungkus jadi zip AnyKernel3
+        run: |
+          set -e
+          cd "$HOME/w"
+          rm -rf pkg && mkdir pkg
+          cp -a ak3/META-INF ak3/tools pkg/
+          cp kernel-4.19/out/arch/arm64/boot/Image.gz pkg/
+          cat > pkg/anykernel.sh <<'EOF'
+          properties() { '
+          kernel.string=Kernel -O2 untuk OPPO A54s (CPH2273), source OPPO 4.19.127
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          # hanya ganti kernel; ramdisk (termasuk Magisk) tidak disentuh
+          split_boot;
+          flash_boot;
+          EOF
+          ZIP="$HOME/w/A54s-kernel-$(date +%Y%m%d-%H%M).zip"
+          (cd pkg && zip -r9 -q "$ZIP" .)
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          ls -l "$ZIP" pkg/Image.gz
+
+      - name: Terbitkan ke Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          cp "$HOME/w/kernel-4.19/out/.config" "$HOME/w/config-hasil-build.txt"
+          gh release create "kernel-${{ github.run_number }}" "$ZIP" "$HOME/w/config-hasil-build.txt" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Kernel A54s build #${{ github.run_number }}" \
+            --notes "Flash zip dengan aplikasi Kernel Flasher (perlu root). Simpan boot.img lama sebagai cadangan."
+
+      - name: Simpan log bila gagal
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ~/w/build.log
+          if-no-files-found: ignore
